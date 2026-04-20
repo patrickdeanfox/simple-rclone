@@ -1,48 +1,48 @@
 #!/usr/bin/env python3
-"""Interactive rclone batch sync script."""
+"""Interactive rclone batch sync — loops until everything is transferred."""
 
 import subprocess
 import sys
 import time
 
+from rclone_common import (
+    copy_args,
+    get_remotes,
+    new_log_path,
+    rclone_cmd,
+    rclone_installed,
+    valid_batch,
+)
+
 
 def run(cmd):
-    """Run a command and return (returncode, stdout+stderr output)."""
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1
+        text=True, bufsize=1,
     )
-    lines = []
     for line in proc.stdout:
-        line = line.rstrip()
-        print(line)
-        lines.append(line)
+        print(line.rstrip())
     proc.wait()
-    return proc.returncode, "\n".join(lines)
+    return proc.returncode
 
 
-def get_remotes():
-    _, out = run(["rclone", "listremotes"])
-    return [r.rstrip(":") for r in out.splitlines() if r.strip()]
-
-
-def transferred_bytes(output):
-    """Parse total bytes transferred from rclone output."""
-    import re
-    for line in reversed(output.splitlines()):
-        m = re.search(r"Transferred:\s+([\d.]+\s*\S+)\s*/\s*([\d.]+\s*\S+),\s*(\d+)%", line)
-        if m:
-            pct = int(m.group(3))
-            return pct
-    return 0
+def prompt_batch():
+    while True:
+        s = input("\nBatch size per run (e.g. 1G, 500M, 5G) [default: 2G]: ").strip() or "2G"
+        if valid_batch(s):
+            return s
+        print("Use a number with optional K/M/G/T suffix.")
 
 
 def main():
+    if not rclone_installed():
+        print("rclone is not installed or not on PATH. See https://rclone.org/install/")
+        sys.exit(1)
+
     print("=" * 50)
     print("  rclone Batch Sync")
     print("=" * 50)
 
-    # Pick remote
     remotes = get_remotes()
     if not remotes:
         print("No rclone remotes found. Run 'rclone config' first.")
@@ -54,81 +54,52 @@ def main():
     while True:
         try:
             choice = int(input("\nSelect remote (number): ")) - 1
-            remote = remotes[choice]
-            break
-        except (ValueError, IndexError):
-            print("Invalid choice, try again.")
+            if 0 <= choice < len(remotes):
+                remote = remotes[choice]
+                break
+        except ValueError:
+            pass
+        print("Invalid choice, try again.")
 
-    # Local folder
     local = input("\nLocal folder path: ").strip()
     if not local:
         print("No path entered.")
         sys.exit(1)
 
-    # Remote folder
     remote_path = input(f"Remote folder on {remote} (e.g. data, photos/2024): ").strip().strip("/")
     remote_full = f"{remote}:{remote_path}" if remote_path else f"{remote}:"
 
-    # Batch size
-    batch = input("\nBatch size per run (e.g. 1G, 500M, 5G) [default: 2G]: ").strip() or "2G"
+    batch = prompt_batch()
+    log_file = new_log_path()
 
     print(f"\nSyncing: {local} → {remote_full}")
     print(f"Batch size: {batch}")
+    print(f"Log file:   {log_file}")
     print("-" * 50)
 
-    base_cmd = [
-        "rclone", "copy", local, remote_full,
-        "--progress",
-        "--transfers", "4",
-        "--checkers", "8",
-        "--ignore-existing",
-        "--max-transfer", batch,
-        "--drive-pacer-min-sleep", "10ms",
-        "--drive-pacer-burst", "200",
-        "--log-file", "/tmp/rclone-batch-sync.log",
-        "--log-level", "INFO",
-    ]
-
+    args = copy_args(local, remote_full, batch, log_file)
     run_number = 0
     while True:
         run_number += 1
         print(f"\n── Run {run_number} ──────────────────────────────────")
         start = time.time()
-
-        rc, output = run(base_cmd)
-
+        rc = run(rclone_cmd(*args))
         elapsed = int(time.time() - start)
         mins, secs = divmod(elapsed, 60)
         print(f"\nRun {run_number} finished in {mins}m {secs}s (exit code {rc})")
 
-        # If nothing was transferred this run, we're done
-        no_transfer = (
-            "Transferred:            0 / 0, -" in output
-            or "Transferred:   \t          0 B / 0 B" in output
-            or ("Transferred:" in output and "0 B / 0 B" in output)
-        )
-
-        if no_transfer or rc == 9:  # rc=9 means --max-transfer limit hit cleanly
-            if no_transfer:
-                print("\n✓ All done — nothing left to transfer.")
-            else:
-                print(f"\nRun {run_number} complete. Pausing 3s before next batch…")
-                time.sleep(3)
-                continue
-
-        if rc not in (0, 9) and not no_transfer:
-            print(f"\nWarning: rclone exited with code {rc}. Check /tmp/rclone-batch-sync.log")
-            retry = input("Continue anyway? (y/n): ").strip().lower()
-            if retry != "y":
-                break
-
-        if no_transfer:
+        if rc == 0:                     # finished — nothing left
+            print("\n✓ All done — nothing left to transfer.")
+            break
+        if rc == 9:                     # --max-transfer hit; more to do
+            print("Pausing 3s before next batch…")
+            time.sleep(3)
+            continue
+        print(f"\nWarning: rclone exited with code {rc}. See {log_file}")
+        if input("Continue anyway? (y/n): ").strip().lower() != "y":
             break
 
-        print(f"Pausing 3s before next batch…")
-        time.sleep(3)
-
-    print("\nLog saved to: /tmp/rclone-batch-sync.log")
+    print(f"\nLog saved to: {log_file}")
     print("Done.")
 
 
