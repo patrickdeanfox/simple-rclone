@@ -756,7 +756,7 @@ class App(tk.Tk):
             tk.Button(row, text="×", fg="#c0392b", width=3, cursor="hand2",
                       command=lambda n=s["name"]: self._del_save(n)
                       ).pack(side="right", padx=(4, 0))
-            tk.Button(row, text="✓", fg="#0f9d58", width=3, cursor="hand2",
+            tk.Button(row, text="✓ Compare", fg="#00897b", width=10, cursor="hand2",
                       command=lambda s=s: self._compare_save(s)
                       ).pack(side="right", padx=(4, 0))
 
