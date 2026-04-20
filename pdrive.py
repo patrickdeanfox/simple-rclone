@@ -570,6 +570,87 @@ class SyncDialog(tk.Toplevel):
         RunWindow(parent, src, dst, batch, self.dry_var.get(), self.auto_var.get())
 
 
+# ── Compare dialog ────────────────────────────────────────────────────────────
+
+class CompareDialog(tk.Toplevel):
+    """Pick any two paths (local or remote) and run rclone check."""
+
+    def __init__(self, parent, remotes):
+        super().__init__(parent)
+        self.title("Compare  (verify sync)")
+        self.remotes = remotes
+        self.resizable(False, False)
+        self._build()
+        self.transient(parent)
+        self.grab_set()
+        self.bind("<Return>", lambda _: self._start())
+        self.bind("<Escape>", lambda _: self.destroy())
+        self.wait_window()
+
+    def _build(self):
+        f = tk.Frame(self, padx=16, pady=12)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+
+        tk.Label(f, text="Remote:", anchor="e", width=14).grid(
+            row=0, column=0, sticky="e", pady=5, padx=(0, 8))
+        self.remote_var = tk.StringVar(value=self.remotes[0] if self.remotes else "")
+        ttk.Combobox(f, textvariable=self.remote_var, values=self.remotes,
+                     state="readonly", width=26).grid(
+            row=0, column=1, columnspan=3, sticky="w", pady=5)
+
+        self.src_var = tk.StringVar()
+        self._path_row(f, 1, "Source:",      self.src_var)
+        self.dst_var = tk.StringVar()
+        self._path_row(f, 2, "Destination:", self.dst_var)
+
+        tk.Label(f,
+                 text="Verifies every file in Source exists in Destination\n"
+                      "with matching size  (rclone check --one-way --size-only).",
+                 fg="gray", justify="left").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(10, 4))
+
+        tk.Button(f, text="  Compare  ", bg="#0f9d58", fg="white",
+                  font=("TkDefaultFont", 11, "bold"),
+                  command=self._start).grid(row=4, column=1, pady=(12, 4), sticky="w")
+
+    def _path_row(self, f, row, label, var):
+        tk.Label(f, text=label, anchor="e", width=14).grid(
+            row=row, column=0, sticky="e", pady=5, padx=(0, 8))
+        tk.Entry(f, textvariable=var, width=32).grid(
+            row=row, column=1, sticky="w", pady=5)
+        tk.Button(f, text="Local…", width=7,
+                  command=lambda v=var: self._pick_local(v)).grid(
+            row=row, column=2, padx=4, pady=5)
+        tk.Button(f, text="Remote…", width=8,
+                  command=lambda v=var: self._pick_remote(v)).grid(
+            row=row, column=3, padx=4, pady=5)
+
+    def _pick_local(self, var):
+        path = filedialog.askdirectory(parent=self, title="Select local folder")
+        if path:
+            var.set(path)
+
+    def _pick_remote(self, var):
+        remote = self.remote_var.get()
+        if not remote:
+            messagebox.showwarning("Select remote", "Choose a remote first.", parent=self)
+            return
+        browser = RemoteBrowser(self, remote)
+        if browser.result is not None:
+            var.set(f"{remote}:{browser.result}" if browser.result else f"{remote}:")
+
+    def _start(self):
+        src = self.src_var.get().strip()
+        dst = self.dst_var.get().strip()
+        if not src or not dst:
+            messagebox.showwarning("Missing", "Fill in both paths.", parent=self)
+            return
+        parent = self.master
+        self.destroy()
+        CompareWindow(parent, src, dst)
+
+
 # ── Status window ─────────────────────────────────────────────────────────────
 
 class StatusWindow(tk.Toplevel):
@@ -635,6 +716,9 @@ class App(tk.Tk):
         tk.Button(body, text="⬇  Download  (remote → local)",
                   bg="#0f9d58", fg="white",
                   command=lambda: self._open_sync("pull"), **btn).pack(pady=4)
+        tk.Button(body, text="✓  Compare  (verify sync)",
+                  bg="#00897b", fg="white",
+                  command=self._open_compare, **btn).pack(pady=4)
         tk.Button(body, text="◎  Connection Status",
                   bg="#444", fg="white",
                   command=self._open_status, **btn).pack(pady=4)
@@ -715,6 +799,12 @@ class App(tk.Tk):
             messagebox.showinfo("No remotes", "No rclone remotes configured.\nRun: rclone config")
             return
         StatusWindow(self, self.remotes)
+
+    def _open_compare(self):
+        if not self.remotes:
+            messagebox.showinfo("No remotes", "No rclone remotes configured.\nRun: rclone config")
+            return
+        CompareDialog(self, self.remotes)
 
 
 def main():
