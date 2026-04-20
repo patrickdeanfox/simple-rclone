@@ -46,10 +46,12 @@ Prompts for remote, local folder, remote path, and batch size — then loops `rc
 
 ## Compare — verify a sync
 
-After a run, confirm that every source file landed on the destination:
+Confirm that every source file landed on the destination:
 
-- **GUI:** click the green `✓` button next to any saved connection, or the
-  `Compare` button that appears once a sync finishes successfully.
+- **GUI:** click the teal `✓ Compare` button on the main window and pick any
+  two paths (local or remote) — handy for ad-hoc verification. Or use the
+  green `✓` button next to a saved connection, or the `Compare` button that
+  appears on the run window once a sync finishes successfully.
 - **CLI:** answer `y` to the `Run compare to verify…` prompt at the end of
   a run.
 
