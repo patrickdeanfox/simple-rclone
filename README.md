@@ -44,6 +44,21 @@ python sync_batch.py
 
 Prompts for remote, local folder, remote path, and batch size — then loops `rclone copy` until everything is transferred.
 
+## Compare — verify a sync
+
+After a run, confirm that every source file landed on the destination:
+
+- **GUI:** click the green `✓` button next to any saved connection, or the
+  `Compare` button that appears once a sync finishes successfully.
+- **CLI:** answer `y` to the `Run compare to verify…` prompt at the end of
+  a run.
+
+Under the hood: `rclone check <src> <dst> --one-way --size-only`. Exit `0`
+means every source file is on the destination with matching size; anything
+else means re-run the sync. One-way mirrors the `copy` semantics (extras on
+the destination are ignored); size-only skips hashing so it's fast and works
+on remotes without hash support.
+
 ## How auto-batch works
 
 rclone's `--max-transfer` flag stops a run after transferring the specified amount, exiting with code `9`. Auto-batch re-runs automatically until rclone exits with `0` (nothing left to transfer), which works around Proton Drive API rate limits without parsing log text.

@@ -6,6 +6,7 @@ import sys
 import time
 
 from rclone_common import (
+    check_args,
     copy_args,
     get_remotes,
     new_log_path,
@@ -100,6 +101,16 @@ def main():
             break
 
     print(f"\nLog saved to: {log_file}")
+
+    if input("\nRun compare to verify every file was copied? (Y/n): ").strip().lower() in ("", "y", "yes"):
+        print("\n── Compare ──────────────────────────────────")
+        check_log = new_log_path()
+        rc = run(rclone_cmd(*check_args(local, remote_full, check_log)))
+        if rc == 0:
+            print("\n✓ All files match — sync is complete.")
+        else:
+            print(f"\n✗ Differences found (exit {rc}) — re-run the sync. See {check_log}")
+
     print("Done.")
 
 

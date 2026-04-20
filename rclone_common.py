@@ -83,3 +83,27 @@ def parse_progress(line):
     if not m:
         return None
     return m.group(1), m.group(2), int(m.group(3))
+
+
+def check_args(src, dst, log_file=None):
+    """Flag set for verifying a completed copy.
+
+    One-way + size-only mirrors the copy semantics: every file on src must
+    exist on dst with matching size; extras on dst are ignored; no hashing,
+    so it's fast and works on remotes without hash support.
+
+    Exit codes:
+      0 — all files match
+      non-zero — differences found (re-run the sync)
+    """
+    args = [
+        "check", src, dst,
+        "--one-way",
+        "--size-only",
+        "--fast-list",
+        "--stats", "2s",
+        "--stats-one-line",
+    ]
+    if log_file:
+        args += ["--log-file", str(log_file), "--log-level", "INFO"]
+    return args
