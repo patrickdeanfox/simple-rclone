@@ -11,6 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from rclone_common import (
+    check_args,
     copy_args,
     get_remotes,
     new_log_path,
@@ -186,7 +187,13 @@ class RunWindow(tk.Toplevel):
 
     def _on_done(self, message):
         self._append_log("\n" + message)
-        self.cancel_btn.config(text="Close", fg="black", command=self.destroy)
+        if message.startswith("✓"):
+            self.cancel_btn.config(
+                text="Compare", fg="black",
+                command=lambda: CompareWindow(self.master,
+                                              self.runner.src, self.runner.dst))
+        else:
+            self.cancel_btn.config(text="Close", fg="black", command=self.destroy)
 
     def _cancel(self):
         if self.runner.proc and self.runner.proc.poll() is None:
@@ -199,6 +206,108 @@ class RunWindow(tk.Toplevel):
         if self.runner.proc and self.runner.proc.poll() is None:
             if not messagebox.askyesno("Cancel sync?",
                                        "A sync is still running. Cancel and close?",
+                                       parent=self):
+                return
+            self.runner.cancel()
+        self.destroy()
+
+
+# ── Compare runner + window ──────────────────────────────────────────────────
+
+class CompareRunner:
+    """Single-shot rclone check — no batching, no progress %, just a verdict."""
+
+    def __init__(self, src, dst, ui):
+        self.src, self.dst = src, dst
+        self.ui = ui
+        self.proc = None
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def run(self):
+        log_file = new_log_path()
+        self.ui.log(f"── Compare  {self.src}  vs  {self.dst}")
+        self.ui.log(f"── log file: {log_file}\n")
+        t0 = time.time()
+        self.proc = subprocess.Popen(
+            rclone_cmd(*check_args(self.src, self.dst, log_file)),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        for line in self.proc.stdout:
+            if self.cancelled:
+                break
+            self.ui.log(line.rstrip())
+        self.proc.wait()
+        elapsed = int(time.time() - t0)
+        rc = self.proc.returncode
+        self.ui.log(f"\nCompare done in {elapsed//60}m {elapsed%60}s  (exit {rc})")
+
+        if self.cancelled:
+            self.ui.done("Cancelled.")
+        elif rc == 0:
+            self.ui.done("✓ All files match — sync is complete.")
+        else:
+            self.ui.done(f"✗ Differences found — re-run the sync. (exit {rc})")
+
+
+class CompareWindow(tk.Toplevel):
+    def __init__(self, parent, src, dst):
+        super().__init__(parent)
+        self.title("rclone Compare — running")
+        self.minsize(680, 420)
+        self._build()
+        self.runner = CompareRunner(src, dst, self)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        threading.Thread(target=self.runner.run, daemon=True).start()
+
+    def _build(self):
+        bar = tk.Frame(self, padx=10, pady=8)
+        bar.pack(fill="x")
+        self.status_lbl = tk.Label(bar, text="Comparing…", anchor="w",
+                                   font=("TkDefaultFont", 10, "bold"))
+        self.status_lbl.pack(side="left", fill="x", expand=True)
+        self.cancel_btn = tk.Button(bar, text="Cancel", fg="#c0392b",
+                                    command=self._cancel)
+        self.cancel_btn.pack(side="right")
+
+        self.txt = scrolledtext.ScrolledText(self, font=("TkFixedFont", 10),
+                                             wrap="none", padx=8, pady=6)
+        self.txt.pack(fill="both", expand=True)
+        self.txt.config(state="disabled")
+
+    def log(self, line):
+        self.after(0, self._append_log, line)
+
+    def done(self, message):
+        self.after(0, self._on_done, message)
+
+    def _append_log(self, line):
+        self.txt.config(state="normal")
+        self.txt.insert("end", line + "\n")
+        self.txt.see("end")
+        self.txt.config(state="disabled")
+
+    def _on_done(self, message):
+        self._append_log("\n" + message)
+        self.status_lbl.config(text=message)
+        self.cancel_btn.config(text="Close", fg="black", command=self.destroy)
+
+    def _cancel(self):
+        if self.runner.proc and self.runner.proc.poll() is None:
+            self.runner.cancel()
+            self._append_log("\nCancelling…")
+        else:
+            self.destroy()
+
+    def _on_close(self):
+        if self.runner.proc and self.runner.proc.poll() is None:
+            if not messagebox.askyesno("Cancel compare?",
+                                       "A compare is still running. Cancel and close?",
                                        parent=self):
                 return
             self.runner.cancel()
@@ -563,11 +672,23 @@ class App(tk.Tk):
             tk.Button(row, text="×", fg="#c0392b", width=3, cursor="hand2",
                       command=lambda n=s["name"]: self._del_save(n)
                       ).pack(side="right", padx=(4, 0))
+            tk.Button(row, text="✓", fg="#0f9d58", width=3, cursor="hand2",
+                      command=lambda s=s: self._compare_save(s)
+                      ).pack(side="right", padx=(4, 0))
 
     def _del_save(self, name):
         if messagebox.askyesno("Delete", f"Delete '{name}'?", parent=self):
             delete_save(name)
             self._refresh_saves()
+
+    def _compare_save(self, s):
+        remote_full = (f"{s['remote']}:{s['remote_path']}"
+                       if s["remote_path"] else f"{s['remote']}:")
+        if s["direction"] == "push":
+            src, dst = s["local"], remote_full
+        else:
+            src, dst = remote_full, s["local"]
+        CompareWindow(self, src, dst)
 
     # ── navigation ────────────────────────────────────────────────────────────
 
