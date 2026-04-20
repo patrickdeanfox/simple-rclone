@@ -98,7 +98,8 @@ class SyncRunner:
         if self.dry_run:
             self.ui.log("\n── Dry run (no files will be copied) ──")
             self._spawn(["copy", self.src, self.dst,
-                         "--dry-run", "--progress", "--ignore-existing"])
+                         "--dry-run", "--stats", "2s", "--stats-one-line",
+                         "--ignore-existing"])
             self.ui.done("Dry run complete. Uncheck 'Dry run first' to transfer for real.")
             return
 

@@ -59,7 +59,8 @@ def copy_args(src, dst, batch, log_file=None):
     """
     args = [
         "copy", src, dst,
-        "--progress",
+        "--stats", "2s",
+        "--stats-one-line",
         "--transfers", "4",
         "--checkers", "8",
         "--ignore-existing",
