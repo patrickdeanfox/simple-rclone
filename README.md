@@ -6,8 +6,9 @@ A minimal tkinter GUI and CLI tool for syncing files with rclone (Proton Drive o
 
 | File | Description |
 |------|-------------|
-| `pdrive.py` | Tkinter GUI — upload/download with folder pickers, saved connections, auto-batch |
+| `pdrive.py` | Tkinter GUI — folder pickers, saved connections, live log + progress bar, cancel button |
 | `sync_batch.py` | CLI batch sync — interactive prompts, loops until all files transferred |
+| `rclone_common.py` | Shared flags, log paths, and helpers used by both front ends |
 
 ## Requirements
 
@@ -30,8 +31,10 @@ python pdrive.py
 - Browse local and remote folders
 - Set batch size (e.g. `2G`) and toggle auto-batch
 - Save connections for quick reuse
+- Live log pane, progress bar, and cancel button while a sync runs
+- `Enter` starts a sync, `Esc` closes a dialog
 
-Sync logs stream to the terminal window.
+Full rclone output is also written to `~/.cache/simple-rclone/rclone-<timestamp>.log`.
 
 ### CLI batch sync
 
@@ -43,4 +46,15 @@ Prompts for remote, local folder, remote path, and batch size — then loops `rc
 
 ## How auto-batch works
 
-rclone's `--max-transfer` flag stops a run after transferring the specified amount. Auto-batch re-runs automatically until nothing is left to transfer, working around Proton Drive API rate limits.
+rclone's `--max-transfer` flag stops a run after transferring the specified amount, exiting with code `9`. Auto-batch re-runs automatically until rclone exits with `0` (nothing left to transfer), which works around Proton Drive API rate limits without parsing log text.
+
+## Defaults applied to every run
+
+Set in `rclone_common.py` so both front ends behave identically:
+
+- `--transfers 4 --checkers 8`
+- `--ignore-existing` (skip files already on the destination)
+- `--fast-list` (fewer API calls on remotes that support it)
+- `--retries 3 --low-level-retries 10 --retries-sleep 10s`
+- `--drive-pacer-min-sleep 10ms --drive-pacer-burst 200`
+- `--log-file <rotating>  --log-level INFO`

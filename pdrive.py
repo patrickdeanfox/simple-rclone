@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""rclone sync GUI — tkinter front end, rclone logs stream to terminal."""
+"""rclone sync GUI — tkinter front end with live log pane and progress bar."""
 
 import json
-import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+from rclone_common import (
+    copy_args,
+    get_remotes,
+    new_log_path,
+    parse_progress,
+    rclone_cmd,
+    rclone_installed,
+    valid_batch,
+)
 
 
 # ── Saved connections ─────────────────────────────────────────────────────────
@@ -38,80 +48,160 @@ def delete_save(name):
 
 # ── rclone helpers ────────────────────────────────────────────────────────────
 
-_stdbuf = shutil.which("stdbuf")
+def rclone_capture(*args):
+    r = subprocess.run(["rclone"] + list(args), capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
 
 
-def rclone(*args, stream=False):
-    base = ([_stdbuf, "-oL", "-eL"] if _stdbuf else []) + ["rclone"]
-    cmd = base + list(args)
-    if stream:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
-        lines = []
-        while True:
-            line = proc.stdout.readline()
-            if line == "" and proc.poll() is not None:
+# ── Sync runner ───────────────────────────────────────────────────────────────
+
+class SyncRunner:
+    """Drives the rclone copy loop. Pushes updates to the run window via callbacks."""
+
+    def __init__(self, src, dst, batch, dry_run, auto_batch, ui):
+        self.src, self.dst = src, dst
+        self.batch = batch
+        self.dry_run = dry_run
+        self.auto_batch = auto_batch
+        self.ui = ui                # RunWindow callbacks
+        self.proc = None
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def _spawn(self, args):
+        self.proc = subprocess.Popen(
+            rclone_cmd(*args),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        for line in self.proc.stdout:
+            if self.cancelled:
                 break
-            if not line:
-                continue
             line = line.rstrip()
-            print(line)
-            lines.append(line)
-        proc.wait()
-        return proc.returncode, "\n".join(lines)
-    else:
-        r = subprocess.run(["rclone"] + list(args), capture_output=True, text=True)
-        return r.returncode, r.stdout + r.stderr
+            self.ui.log(line)
+            prog = parse_progress(line)
+            if prog:
+                self.ui.progress(prog[2], f"{prog[0]} / {prog[1]}")
+        self.proc.wait()
+        return self.proc.returncode
 
+    def run(self):
+        log_file = new_log_path()
+        self.ui.log(f"── {self.src}  →  {self.dst}")
+        self.ui.log(f"── batch={self.batch}  auto={'yes' if self.auto_batch else 'one run'}")
+        self.ui.log(f"── log file: {log_file}")
 
-def get_remotes():
-    _, out = rclone("listremotes")
-    return [r.rstrip(":") for r in out.splitlines() if r.strip()]
-
-
-def _run_sync(src, dst, batch, dry_run, auto_batch):
-    """Run in background thread — all output goes to terminal."""
-    print(f"\n{'─'*52}")
-    print(f"  {src}  →  {dst}")
-    print(f"  batch={batch}  auto={'yes' if auto_batch else 'one run'}")
-    print(f"{'─'*52}")
-
-    if dry_run:
-        print("\n── Dry run (no files will be copied) ──")
-        rclone("copy", src, dst, "--dry-run", "--progress", "--ignore-existing", stream=True)
-        print("\nDry run complete. Uncheck 'Dry run first' and press Start to transfer for real.")
-        return
-
-    run_n = 0
-    while True:
-        run_n += 1
-        print(f"\n── Batch {run_n} ──────────────────────────────")
-        t0 = time.time()
-        rc, out = rclone("copy", src, dst,
-                         "--progress", "--transfers", "4", "--checkers", "8",
-                         "--ignore-existing", "--max-transfer", batch,
-                         "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200",
-                         stream=True)
-        elapsed = int(time.time() - t0)
-        print(f"\nBatch {run_n} done in {elapsed//60}m {elapsed%60}s  (exit {rc})")
-
-        nothing_left = "0 B / 0 B" in out or ("Transferred:" in out and ", 0 B" in out)
-        if nothing_left:
-            print("\n✓ All done — nothing left to transfer.")
+        if self.dry_run:
+            self.ui.log("\n── Dry run (no files will be copied) ──")
+            self._spawn(["copy", self.src, self.dst,
+                         "--dry-run", "--progress", "--ignore-existing"])
+            self.ui.done("Dry run complete. Uncheck 'Dry run first' to transfer for real.")
             return
 
-        if not auto_batch:
-            print("\nOne batch complete. Run again to continue.")
+        run_n = 0
+        while not self.cancelled:
+            run_n += 1
+            self.ui.log(f"\n── Batch {run_n} ──")
+            self.ui.progress(0, "starting…")
+            t0 = time.time()
+            rc = self._spawn(copy_args(self.src, self.dst, self.batch, log_file))
+            elapsed = int(time.time() - t0)
+            self.ui.log(f"\nBatch {run_n} done in {elapsed//60}m {elapsed%60}s  (exit {rc})")
+
+            if self.cancelled:
+                self.ui.done("Cancelled.")
+                return
+            if rc == 0:
+                self.ui.progress(100, "complete")
+                self.ui.done("✓ All done — nothing left to transfer.")
+                return
+            if not self.auto_batch:
+                self.ui.done("One batch complete. Press Start again to continue.")
+                return
+            if rc == 9:                  # max-transfer hit; more work to do
+                self.ui.log("Pausing 3s before next batch…")
+                time.sleep(3)
+                continue
+            self.ui.done(f"Error: rclone exited {rc}. See log: {log_file}")
             return
 
-        if rc == 9:
-            print("Pausing 3s before next batch…")
-            time.sleep(3)
-            continue
 
-        if rc not in (0, 9):
-            print(f"\nError: rclone exited {rc}. Check output above.")
-            return
+# ── Run window (live log + progress + cancel) ────────────────────────────────
+
+class RunWindow(tk.Toplevel):
+    def __init__(self, parent, src, dst, batch, dry_run, auto_batch):
+        super().__init__(parent)
+        self.title("rclone Sync — running")
+        self.minsize(680, 420)
+        self._build()
+        self.runner = SyncRunner(src, dst, batch, dry_run, auto_batch, self)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        threading.Thread(target=self.runner.run, daemon=True).start()
+
+    def _build(self):
+        bar = tk.Frame(self, padx=10, pady=8)
+        bar.pack(fill="x")
+        self.pct_lbl = tk.Label(bar, text="0%", width=5, anchor="w",
+                                font=("TkFixedFont", 10))
+        self.pct_lbl.pack(side="left")
+        self.bar = ttk.Progressbar(bar, mode="determinate", maximum=100)
+        self.bar.pack(side="left", fill="x", expand=True, padx=8)
+        self.detail_lbl = tk.Label(bar, text="", width=22, anchor="e",
+                                   font=("TkFixedFont", 9), fg="#555")
+        self.detail_lbl.pack(side="left")
+        self.cancel_btn = tk.Button(bar, text="Cancel", fg="#c0392b",
+                                    command=self._cancel)
+        self.cancel_btn.pack(side="left", padx=(8, 0))
+
+        self.txt = scrolledtext.ScrolledText(self, font=("TkFixedFont", 10),
+                                             wrap="none", padx=8, pady=6)
+        self.txt.pack(fill="both", expand=True)
+        self.txt.config(state="disabled")
+
+    # callbacks invoked from worker thread; marshal to the Tk thread
+    def log(self, line):
+        self.after(0, self._append_log, line)
+
+    def progress(self, pct, detail=""):
+        self.after(0, self._set_progress, pct, detail)
+
+    def done(self, message):
+        self.after(0, self._on_done, message)
+
+    def _append_log(self, line):
+        self.txt.config(state="normal")
+        self.txt.insert("end", line + "\n")
+        self.txt.see("end")
+        self.txt.config(state="disabled")
+
+    def _set_progress(self, pct, detail):
+        self.bar["value"] = pct
+        self.pct_lbl.config(text=f"{pct}%")
+        self.detail_lbl.config(text=detail)
+
+    def _on_done(self, message):
+        self._append_log("\n" + message)
+        self.cancel_btn.config(text="Close", fg="black", command=self.destroy)
+
+    def _cancel(self):
+        if self.runner.proc and self.runner.proc.poll() is None:
+            self.runner.cancel()
+            self._append_log("\nCancelling…")
+        else:
+            self.destroy()
+
+    def _on_close(self):
+        if self.runner.proc and self.runner.proc.poll() is None:
+            if not messagebox.askyesno("Cancel sync?",
+                                       "A sync is still running. Cancel and close?",
+                                       parent=self):
+                return
+            self.runner.cancel()
+        self.destroy()
 
 
 # ── Remote browser ────────────────────────────────────────────────────────────
@@ -132,6 +222,7 @@ class RemoteBrowser(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
         self._load()
+        self.bind("<Escape>", lambda _: self.destroy())
         self.wait_window()
 
     def _build(self):
@@ -150,6 +241,7 @@ class RemoteBrowser(tk.Toplevel):
         sb.config(command=self.lb.yview)
         self.lb.bind("<Double-Button-1>", lambda _: self._open())
         self.lb.bind("<Return>",          lambda _: self._open())
+        self.lb.bind("<BackSpace>",       lambda _: self._back())
 
         bot = tk.Frame(self, pady=8, padx=10)
         bot.pack(fill="x")
@@ -166,8 +258,8 @@ class RemoteBrowser(tk.Toplevel):
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self):
-        rc, out = rclone("lsjson", f"{self.remote}:{self.path}",
-                         "--no-modtime", "--no-mimetype")
+        rc, out = rclone_capture("lsjson", f"{self.remote}:{self.path}",
+                                 "--no-modtime", "--no-mimetype")
         try:
             self.items = [i for i in json.loads(out) if i.get("IsDir")] if rc == 0 else []
         except Exception:
@@ -220,6 +312,8 @@ class SyncDialog(tk.Toplevel):
             self._apply_prefill(prefill)
         self.transient(parent)
         self.grab_set()
+        self.bind("<Return>", lambda _: self._start())
+        self.bind("<Escape>", lambda _: self.destroy())
         self.wait_window()
 
     # ── layout ────────────────────────────────────────────────────────────────
@@ -229,7 +323,6 @@ class SyncDialog(tk.Toplevel):
         f.pack(fill="both", expand=True)
         f.columnconfigure(1, weight=1)
 
-        # Remote dropdown
         tk.Label(f, text="Remote:", anchor="e", width=20).grid(
             row=0, column=0, sticky="e", pady=5, padx=(0, 8))
         self.remote_var = tk.StringVar(value=self.remotes[0] if self.remotes else "")
@@ -244,7 +337,6 @@ class SyncDialog(tk.Toplevel):
             self._remote_row(f, 1, "Remote source:")
             self._local_row(f, 2, "Local destination:")
 
-        # Batch size
         tk.Label(f, text="Batch size:", anchor="e", width=20).grid(
             row=3, column=0, sticky="e", pady=5, padx=(0, 8))
         self.batch_var = tk.StringVar(value="2G")
@@ -253,17 +345,15 @@ class SyncDialog(tk.Toplevel):
         tk.Label(f, text="e.g. 500M · 2G · 10G", fg="gray").grid(
             row=3, column=2, sticky="w")
 
-        # Checkboxes
         self.dry_var  = tk.BooleanVar(value=True)
         self.auto_var = tk.BooleanVar(value=True)
         tk.Checkbutton(f, text="Dry run first  (safe preview — no files copied)",
                        variable=self.dry_var).grid(
             row=4, column=1, columnspan=2, sticky="w", pady=2)
-        tk.Checkbutton(f, text="Auto-batch until fully done",
+        tk.Checkbutton(f, text="Auto-batch until fully done  (set & forget)",
                        variable=self.auto_var).grid(
             row=5, column=1, columnspan=2, sticky="w", pady=2)
 
-        # Save section
         sf = tk.LabelFrame(f, text="Save this connection", padx=8, pady=6)
         sf.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 4))
         tk.Label(sf, text="Name:").pack(side="left")
@@ -271,7 +361,6 @@ class SyncDialog(tk.Toplevel):
         tk.Entry(sf, textvariable=self.name_var, width=26).pack(side="left", padx=6)
         tk.Button(sf, text="Save", command=self._save).pack(side="left")
 
-        # Start
         tk.Button(f, text="  Start  ", bg="#1a73e8", fg="white",
                   font=("TkDefaultFont", 11, "bold"),
                   command=self._start).grid(row=7, column=1, pady=(12, 4), sticky="w")
@@ -331,13 +420,19 @@ class SyncDialog(tk.Toplevel):
         if not local or self._remote_path is None:
             messagebox.showwarning("Incomplete", "Fill in all paths before saving.", parent=self)
             return
+        batch = self.batch_var.get().strip() or "2G"
+        if not valid_batch(batch):
+            messagebox.showwarning("Bad batch size",
+                                   "Use a number with optional K/M/G/T suffix (e.g. 500M, 2G).",
+                                   parent=self)
+            return
         upsert_save({
             "name":       name,
             "direction":  self.direction,
             "remote":     self.remote_var.get(),
             "remote_path": self._remote_path,
             "local":      local,
-            "batch":      self.batch_var.get().strip() or "2G",
+            "batch":      batch,
             "auto_batch": self.auto_var.get(),
         })
         messagebox.showinfo("Saved", f"'{name}' saved.", parent=self)
@@ -352,13 +447,17 @@ class SyncDialog(tk.Toplevel):
             messagebox.showwarning("Missing", "Select a local folder.", parent=self); return
         if self._remote_path is None:
             messagebox.showwarning("Missing", "Browse and select a remote folder.", parent=self); return
+        if not valid_batch(batch):
+            messagebox.showwarning("Bad batch size",
+                                   "Use a number with optional K/M/G/T suffix (e.g. 500M, 2G).",
+                                   parent=self)
+            return
 
         remote_full = f"{remote}:{self._remote_path}" if self._remote_path else f"{remote}:"
         src, dst = (local, remote_full) if self.direction == "push" else (remote_full, local)
-        dry  = self.dry_var.get()
-        auto = self.auto_var.get()
+        parent = self.master
         self.destroy()
-        threading.Thread(target=_run_sync, args=(src, dst, batch, dry, auto), daemon=True).start()
+        RunWindow(parent, src, dst, batch, self.dry_var.get(), self.auto_var.get())
 
 
 # ── Status window ─────────────────────────────────────────────────────────────
@@ -383,11 +482,11 @@ class StatusWindow(tk.Toplevel):
         lines = []
         for r in remotes:
             lines.append(f"\n{r}:")
-            rc, out = rclone("about", f"{r}:")
+            rc, out = rclone_capture("about", f"{r}:")
             if rc == 0:
                 lines += [f"  {l}" for l in out.splitlines()]
             else:
-                rc2, _ = rclone("lsd", f"{r}:", "--max-depth", "0")
+                rc2, _ = rclone_capture("lsd", f"{r}:", "--max-depth", "0")
                 lines.append(f"  {'Connected ✓' if rc2 == 0 else 'Not reachable ✗'}")
         self.after(0, lambda: self._show(txt, "\n".join(lines)))
 
@@ -410,15 +509,13 @@ class App(tk.Tk):
         self.after(100, self._load_remotes)
 
     def _build(self):
-        # Header
         hdr = tk.Frame(self, bg="#1a1a2e", pady=16)
         hdr.pack(fill="x")
         tk.Label(hdr, text="rclone Sync", font=("TkDefaultFont", 16, "bold"),
                  bg="#1a1a2e", fg="white").pack()
-        tk.Label(hdr, text="logs stream to terminal", font=("TkDefaultFont", 9),
-                 bg="#1a1a2e", fg="#666").pack()
+        tk.Label(hdr, text="set & forget batched sync", font=("TkDefaultFont", 9),
+                 bg="#1a1a2e", fg="#888").pack()
 
-        # Main action buttons
         body = tk.Frame(self, padx=24, pady=16)
         body.pack(fill="x")
         btn = dict(width=28, height=2, font=("TkDefaultFont", 11), cursor="hand2")
@@ -432,7 +529,6 @@ class App(tk.Tk):
                   bg="#444", fg="white",
                   command=self._open_status, **btn).pack(pady=4)
 
-        # Saved connections panel
         sep = tk.Frame(self, height=1, bg="#ddd")
         sep.pack(fill="x", padx=16)
         tk.Label(self, text="SAVED CONNECTIONS",
@@ -441,7 +537,6 @@ class App(tk.Tk):
         self.saves_frame.pack(fill="x", pady=(0, 8))
         self._refresh_saves()
 
-        # Footer status
         self.status_lbl = tk.Label(self, text="Loading remotes…",
                                    fg="gray", font=("TkDefaultFont", 9), pady=8)
         self.status_lbl.pack()
@@ -491,7 +586,7 @@ class App(tk.Tk):
             messagebox.showinfo("No remotes", "No rclone remotes configured.\nRun: rclone config")
             return
         SyncDialog(self, self.remotes, direction, prefill=prefill)
-        self._refresh_saves()          # pick up any saves made inside the dialog
+        self._refresh_saves()
 
     def _open_status(self):
         if not self.remotes:
@@ -500,5 +595,18 @@ class App(tk.Tk):
         StatusWindow(self, self.remotes)
 
 
-if __name__ == "__main__":
+def main():
+    if not rclone_installed():
+        try:
+            root = tk.Tk(); root.withdraw()
+            messagebox.showerror("rclone not found",
+                                 "rclone is not installed or not on PATH.\n"
+                                 "Install from https://rclone.org/install/")
+        except tk.TclError:
+            print("rclone is not installed or not on PATH.", file=sys.stderr)
+        sys.exit(1)
     App().mainloop()
+
+
+if __name__ == "__main__":
+    main()
